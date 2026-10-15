@@ -1107,7 +1107,20 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                                 .pending_usage_record
                                 .as_ref()
                                 .is_some_and(|record| record.turn_id != payload.turn_id));
-                    if starts_other_turn {
+                    // These terminal events mean this turn cannot later write
+                    // its token_count. Settle the record now rather than leaving
+                    // a completed rollout permanently undercounted. A stamped
+                    // terminal event must name the pending record's turn; an
+                    // unstamped one applies to the active pending turn.
+                    let ends_pending_turn = entry.entry_type == "event_msg"
+                        && matches!(
+                            payload.payload_type.as_deref(),
+                            Some("turn_aborted" | "task_complete")
+                        )
+                        && state.pending_usage_record.as_ref().is_some_and(|record| {
+                            payload.turn_id.is_none() || record.turn_id == payload.turn_id
+                        });
+                    if starts_other_turn || ends_pending_turn {
                         emit_unconfirmed_usage_record(
                             &mut state,
                             session_id,
@@ -5246,6 +5259,56 @@ mod tests {
         assert_eq!(incremental.messages, expected);
     }
 
+    const COMPRESSED_TURN_CONTEXT: &str =
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#;
+    const COMPRESSED_USAGE: &str = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"#,
+        r#""cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"#,
+        r#""cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+    );
+
+    #[test]
+    fn compressed_archive_accepts_aggregate_input_above_simulated_legacy_limit() {
+        const LEGACY_ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
+        const SIMULATED_LEGACY_LIMIT: u64 = 512;
+        const LIMIT_SCALE: u64 = LEGACY_ARCHIVE_LIMIT / SIMULATED_LEGACY_LIMIT;
+        let simulated_current_limit = MAX_CODEX_ARCHIVE_BYTES / LIMIT_SCALE;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("above-legacy-limit.jsonl.zst");
+        let padding_record = format!(
+            r#"{{"timestamp":"2026-10-01T00:00:01Z","type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
+            "x".repeat(128)
+        );
+        let content = format!(
+            "{COMPRESSED_TURN_CONTEXT}\n{padding_record}\n{padding_record}\n{COMPRESSED_USAGE}\n"
+        );
+        assert!(content.len() as u64 > SIMULATED_LEGACY_LIMIT);
+        assert!(content.len() as u64 <= simulated_current_limit);
+        std::fs::write(&path, zstd::encode_all(content.as_bytes(), 0).unwrap()).unwrap();
+
+        {
+            let _limit = register_archive_limit_override(&path, SIMULATED_LEGACY_LIMIT);
+            let legacy = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+            assert!(!legacy.parse_succeeded);
+            assert_eq!(
+                legacy.archive_failure.unwrap().cause,
+                CodexArchiveFailureCause::DecodedSizeLimit {
+                    limit_bytes: SIMULATED_LEGACY_LIMIT,
+                }
+            );
+        }
+
+        let _limit = register_archive_limit_override(&path, simulated_current_limit);
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+
+        assert!(parsed.parse_succeeded);
+        assert!(parsed.archive_failure.is_none());
+        assert!(parsed.consumed_offset > SIMULATED_LEGACY_LIMIT);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].tokens.total(), 160);
+    }
+
     #[test]
     fn compressed_archive_skips_oversized_record_and_retains_later_usage() {
         use std::io::Write as _;
@@ -5258,9 +5321,9 @@ mod tests {
         );
         let mut encoder =
             zstd::stream::write::Encoder::new(std::fs::File::create(&path).unwrap(), 0).unwrap();
-        writeln!(encoder, r#"{{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#).unwrap();
+        writeln!(encoder, "{COMPRESSED_TURN_CONTEXT}").unwrap();
         writeln!(encoder, "{oversized_record}").unwrap();
-        writeln!(encoder, r#"{{"timestamp":"2026-10-01T00:00:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}},"last_token_usage":{{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}}}}}"#).unwrap();
+        writeln!(encoder, "{COMPRESSED_USAGE}").unwrap();
         encoder.finish().unwrap();
 
         let _limit = register_record_limit_override(&path, 512);
@@ -5897,9 +5960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cut_off_response_before_turn_aborted_at_end_of_file_stays_pending() {
-        // Known limitation, pinned so a change to it is deliberate: a final
-        // response with no token_count and no later turn is never emitted.
+    fn test_cut_off_response_is_emitted_when_its_turn_is_aborted() {
         let file = create_test_file(
             &(session_meta_line("codex_vscode")
                 + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
@@ -5910,8 +5971,24 @@ mod tests {
 
         let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
 
-        assert!(parsed.messages.is_empty());
-        assert!(parsed.state.pending_usage_record.is_some());
+        assert_eq!(turn_totals(&parsed.messages), vec![110]);
+        assert!(parsed.state.pending_usage_record.is_none());
+    }
+
+    #[test]
+    fn test_cut_off_response_is_emitted_when_its_task_completes() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + r#"{"timestamp":"2026-10-01T00:01:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#
+                + "\n"),
+        );
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+
+        assert_eq!(turn_totals(&parsed.messages), vec![110]);
+        assert!(parsed.state.pending_usage_record.is_none());
     }
 
     #[test]
