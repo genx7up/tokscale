@@ -3377,7 +3377,11 @@ fn read_shard_with_limit(
             Ok(entries) => ShardReadStatus::Loaded(
                 entries
                     .into_iter()
-                    .map(|(entry, checkpoint)| entry.with_claude_checkpoint(checkpoint))
+                    .map(|(entry, checkpoint)| {
+                        let checkpoint =
+                            checkpoint.filter(|checkpoint| checkpoint.has_valid_integrity());
+                        entry.with_claude_checkpoint(checkpoint)
+                    })
                     .collect(),
             ),
             Err(error) => ShardReadStatus::Invalid(error.to_string()),
@@ -7609,6 +7613,22 @@ mod tests {
         assert_eq!(entries[0].claude_checkpoint, entry.claude_checkpoint);
         assert_eq!(entries[0].messages, entry.messages);
         assert!(!entries[0].needs_retention_provenance_migration());
+
+        // A valid bincode mutation of parser state must discard only the
+        // checkpoint. The cached messages remain available and a changed file
+        // will take the ordinary full-parse path.
+        let mut corrupted = entry.clone();
+        corrupted
+            .claude_checkpoint
+            .as_mut()
+            .unwrap()
+            .corrupt_state_for_test();
+        write_shard_with_limit(&shard, identity, &[corrupted], MAX_CACHE_SHARD_BYTES).unwrap();
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a shard with a corrupted checkpoint still loads its messages");
+        };
+        assert!(entries[0].claude_checkpoint.is_none());
+        assert_eq!(entries[0].messages, entry.messages);
 
         // Only Claude reads it.
         let other = CacheIdentity::for_client(ClientId::Codex);

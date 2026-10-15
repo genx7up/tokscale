@@ -428,7 +428,7 @@ pub fn parse_claude_file_with_cache_and_home(
     parent_cache: &mut ParentSubagentTypeCache,
     home_dir: Option<&Path>,
 ) -> Vec<UnifiedMessage> {
-    parse_claude_file_checkpointed(path, parent_cache, home_dir).messages
+    parse_claude_file_internal(path, parent_cache, home_dir, false).messages
 }
 
 /// One parse of a transcript, plus the point a later parse can continue from
@@ -453,6 +453,10 @@ pub(crate) struct ClaudeCheckpoint {
     prefix_sha256: [u8; 32],
     message_count: usize,
     message_digest: [u8; 32],
+    /// Digest of every other resume-relevant field in this checkpoint. Cache
+    /// shards have no envelope checksum, so a valid-looking mutation of parser
+    /// state must make this checkpoint unusable rather than alter appended rows.
+    integrity_digest: [u8; 32],
     /// `cache_write_1h` values the end-of-file clamp lowered, by message
     /// index. A streamed duplicate after the checkpoint has to merge against
     /// the unclamped value, exactly as it would in a full parse.
@@ -474,6 +478,52 @@ struct ClaudeParseState {
     suppress_unattributed_tool_results: bool,
     sidechain_agent: Option<String>,
     sidechain_detected: bool,
+}
+
+impl ClaudeCheckpoint {
+    fn computed_integrity_digest(&self) -> Option<[u8; 32]> {
+        // HashSet iteration is randomized, so canonicalize it before hashing.
+        let mut split_reporting_dedup_keys = self
+            .state
+            .split_reporting_dedup_keys
+            .iter()
+            .collect::<Vec<_>>();
+        split_reporting_dedup_keys.sort_unstable();
+        let state = (
+            &self.state.session_id,
+            &self.state.provider_confidences,
+            split_reporting_dedup_keys,
+            self.state.pending_turn_start,
+            self.state.pending_request_start_timestamp_ms,
+            &self.state.last_model,
+            &self.state.last_provider_hint,
+            self.state.suppress_unattributed_tool_results,
+            &self.state.sidechain_agent,
+            self.state.sidechain_detected,
+        );
+        let bytes = bincode::serialize(&(
+            &self.client_id,
+            &self.metadata_provider_hint,
+            self.consumed_offset,
+            self.prefix_sha256,
+            self.message_count,
+            self.message_digest,
+            &self.unclamped_cache_write_1h,
+            state,
+        ))
+        .ok()?;
+        Some(Sha256::digest(bytes).into())
+    }
+
+    pub(crate) fn has_valid_integrity(&self) -> bool {
+        self.computed_integrity_digest()
+            .is_some_and(|digest| digest == self.integrity_digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_state_for_test(&mut self) {
+        self.state.pending_turn_start = !self.state.pending_turn_start;
+    }
 }
 
 /// What a transcript's path and environment decide, independently of its
@@ -528,7 +578,8 @@ impl ClaudeFileContext {
 /// Where `parse_claude_lines` starts: byte 0 with nothing parsed, or a
 /// verified checkpoint with the messages produced before it.
 struct ClaudeParseStart {
-    prefix_hasher: Sha256,
+    /// `None` keeps the ordinary non-resumable parser off checkpoint work.
+    prefix_hasher: Option<Sha256>,
     consumed_offset: u64,
     messages: Vec<UnifiedMessage>,
     state: ClaudeParseState,
@@ -543,7 +594,7 @@ pub(crate) fn parse_claude_file_with_checkpoint(
     home_dir: Option<&Path>,
 ) -> ClaudeParse {
     let mut parent_cache = ParentSubagentTypeCache::new();
-    parse_claude_file_checkpointed(path, &mut parent_cache, home_dir)
+    parse_claude_file_internal(path, &mut parent_cache, home_dir, true)
 }
 
 /// Continue a transcript's parse from `checkpoint`, given the messages the
@@ -567,6 +618,7 @@ pub(crate) fn resume_claude_file(
     if context.is_json
         || context.client_id != checkpoint.client_id
         || context.metadata_provider_hint != checkpoint.metadata_provider_hint
+        || !checkpoint.has_valid_integrity()
         || checkpoint.state.provider_confidences.len() != checkpoint.message_count
     {
         return None;
@@ -610,7 +662,7 @@ pub(crate) fn resume_claude_file(
         &context,
         reader,
         ClaudeParseStart {
-            prefix_hasher,
+            prefix_hasher: Some(prefix_hasher),
             consumed_offset: checkpoint.consumed_offset,
             messages,
             state: checkpoint.state.clone(),
@@ -619,10 +671,11 @@ pub(crate) fn resume_claude_file(
     ))
 }
 
-fn parse_claude_file_checkpointed(
+fn parse_claude_file_internal(
     path: &Path,
     parent_cache: &mut ParentSubagentTypeCache,
     home_dir: Option<&Path>,
+    capture_checkpoint: bool,
 ) -> ClaudeParse {
     // Workflow orchestration journals are metadata, not transcripts — never ingest.
     if is_workflow_journal(path) {
@@ -667,7 +720,7 @@ fn parse_claude_file_checkpointed(
         &context,
         BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file),
         ClaudeParseStart {
-            prefix_hasher: Sha256::new(),
+            prefix_hasher: capture_checkpoint.then(Sha256::new),
             consumed_offset: 0,
             messages: Vec::with_capacity(64),
             state: ClaudeParseState {
@@ -771,7 +824,9 @@ fn parse_claude_lines(
         match reader.read_until(b'\n', &mut raw_line) {
             Ok(0) => break,
             Ok(read) => {
-                prefix_hasher.update(&raw_line);
+                if let Some(prefix_hasher) = prefix_hasher.as_mut() {
+                    prefix_hasher.update(&raw_line);
+                }
                 consumed_offset += read as u64;
                 ends_with_newline = raw_line.last() == Some(&b'\n');
             }
@@ -1116,26 +1171,32 @@ fn parse_claude_lines(
     let checkpoint = if checkpoint_blocked || !ends_with_newline {
         None
     } else {
-        claude_message_digest(&messages).map(|message_digest| ClaudeCheckpoint {
-            client_id: client_id.clone(),
-            metadata_provider_hint: context.metadata_provider_hint.clone(),
-            consumed_offset,
-            prefix_sha256: prefix_hasher.finalize().into(),
-            message_count: messages.len(),
-            message_digest,
-            unclamped_cache_write_1h,
-            state: ClaudeParseState {
-                session_id,
-                provider_confidences,
-                split_reporting_dedup_keys,
-                pending_turn_start,
-                pending_request_start_timestamp_ms,
-                last_model,
-                last_provider_hint,
-                suppress_unattributed_tool_results,
-                sidechain_agent,
-                sidechain_detected,
-            },
+        prefix_hasher.and_then(|prefix_hasher| {
+            let message_digest = claude_message_digest(&messages)?;
+            let mut checkpoint = ClaudeCheckpoint {
+                client_id: client_id.clone(),
+                metadata_provider_hint: context.metadata_provider_hint.clone(),
+                consumed_offset,
+                prefix_sha256: prefix_hasher.finalize().into(),
+                message_count: messages.len(),
+                message_digest,
+                integrity_digest: [0; 32],
+                unclamped_cache_write_1h,
+                state: ClaudeParseState {
+                    session_id,
+                    provider_confidences,
+                    split_reporting_dedup_keys,
+                    pending_turn_start,
+                    pending_request_start_timestamp_ms,
+                    last_model,
+                    last_provider_hint,
+                    suppress_unattributed_tool_results,
+                    sidechain_agent,
+                    sidechain_detected,
+                },
+            };
+            checkpoint.integrity_digest = checkpoint.computed_integrity_digest()?;
+            Some(checkpoint)
         })
     };
 
@@ -4505,6 +4566,24 @@ mod resume_tests {
     }
 
     #[test]
+    fn test_resume_refuses_checkpoint_with_corrupted_parser_state() {
+        let lines = fixture_lines();
+        let dir = TempDir::new().unwrap();
+        let path = transcript_path(&dir);
+        append(&path, &lines[..5]);
+        let first = parse_claude_file_with_checkpoint(&path, None);
+        let mut checkpoint = first.checkpoint.clone().unwrap();
+        append(&path, &lines[5..]);
+        assert!(resume_claude_file(&path, None, &checkpoint, &first.messages).is_some());
+
+        checkpoint.corrupt_state_for_test();
+        assert!(
+            resume_claude_file(&path, None, &checkpoint, &first.messages).is_none(),
+            "a valid-looking parser-state mutation must force a full parse"
+        );
+    }
+
+    #[test]
     fn test_no_checkpoint_where_the_end_of_the_file_still_decides_the_result() {
         let timed = r#"{"type":"assistant","timestamp":"2026-10-01T10:00:01.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-sonnet-4-5","usage":{"input_tokens":3,"output_tokens":1}}}"#;
         let cases: [(&str, String); 5] = [
@@ -4571,9 +4650,14 @@ mod resume_tests {
         let dir = TempDir::new().unwrap();
         let path = transcript_path(&dir);
         append(&path, &lines);
-        assert_eq!(
-            parse_claude_file_with_checkpoint(&path, None).messages,
-            parse_claude_file_with_home(&path, None)
+        let checkpointed = parse_claude_file_with_checkpoint(&path, None);
+        let mut parent_cache = ParentSubagentTypeCache::new();
+        let plain = parse_claude_file_internal(&path, &mut parent_cache, None, false);
+        assert_eq!(checkpointed.messages, plain.messages);
+        assert!(checkpointed.checkpoint.is_some());
+        assert!(
+            plain.checkpoint.is_none(),
+            "the plain parser must not construct a discarded checkpoint"
         );
     }
 }
