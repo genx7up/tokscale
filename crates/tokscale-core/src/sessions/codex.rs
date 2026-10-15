@@ -928,7 +928,20 @@ fn parse_codex_reader<R: BufRead>(
                                 .pending_usage_record
                                 .as_ref()
                                 .is_some_and(|record| record.turn_id != payload.turn_id));
-                    if starts_other_turn {
+                    // These terminal events mean this turn cannot later write
+                    // its token_count. Settle the record now rather than leaving
+                    // a completed rollout permanently undercounted. A stamped
+                    // terminal event must name the pending record's turn; an
+                    // unstamped one applies to the active pending turn.
+                    let ends_pending_turn = entry.entry_type == "event_msg"
+                        && matches!(
+                            payload.payload_type.as_deref(),
+                            Some("turn_aborted" | "task_complete")
+                        )
+                        && state.pending_usage_record.as_ref().is_some_and(|record| {
+                            payload.turn_id.is_none() || record.turn_id == payload.turn_id
+                        });
+                    if starts_other_turn || ends_pending_turn {
                         emit_unconfirmed_usage_record(
                             &mut state,
                             session_id,
@@ -5644,9 +5657,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cut_off_response_before_turn_aborted_at_end_of_file_stays_pending() {
-        // Known limitation, pinned so a change to it is deliberate: a final
-        // response with no token_count and no later turn is never emitted.
+    fn test_cut_off_response_is_emitted_when_its_turn_is_aborted() {
         let file = create_test_file(
             &(session_meta_line("codex_vscode")
                 + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
@@ -5657,8 +5668,24 @@ mod tests {
 
         let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
 
-        assert!(parsed.messages.is_empty());
-        assert!(parsed.state.pending_usage_record.is_some());
+        assert_eq!(turn_totals(&parsed.messages), vec![110]);
+        assert!(parsed.state.pending_usage_record.is_none());
+    }
+
+    #[test]
+    fn test_cut_off_response_is_emitted_when_its_task_completes() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + r#"{"timestamp":"2026-10-01T00:01:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#
+                + "\n"),
+        );
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+
+        assert_eq!(turn_totals(&parsed.messages), vec![110]);
+        assert!(parsed.state.pending_usage_record.is_none());
     }
 
     #[test]
